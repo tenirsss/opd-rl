@@ -1,11 +1,14 @@
 # 复现说明
 
+本仓库在 GitHub 上对应 `tenirsss/opd-rl`，代码基于 `verl-agent`，增加了 SERL/OPD 相关复现实验脚本。
+
 ## 1. 配环境
 
 1.1在 repo 根目录执行：
 
 ```bash
-cd /path/to/verl-agent
+git clone https://github.com/tenirsss/opd-rl.git
+cd opd-rl
 bash setup_envA.sh
 source ~/venvs/verl-agent/bin/activate
 ```
@@ -38,8 +41,8 @@ bash scripts/prepare_alfworld_data.sh
 默认等价于：
 
 ```bash
-DATA_DIR=/path/to/verl-agent/data \
-ALFWORLD_DATA=/path/to/verl-agent/data \
+DATA_DIR=/path/to/opd-rl/data \
+ALFWORLD_DATA=/path/to/opd-rl/data \
 bash scripts/prepare_alfworld_data.sh
 ```
 
