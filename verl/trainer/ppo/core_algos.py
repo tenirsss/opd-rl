@@ -19,6 +19,7 @@ implement PPO
 """
 
 from collections import defaultdict
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -426,6 +427,103 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
+
+
+def _serl_effective_lambda(serl_config: Any, update_step: int) -> float:
+    mixing_lambda = float(serl_config.get("mixing_lambda", 1.0))
+    if not 0.0 <= mixing_lambda <= 1.0:
+        raise ValueError(f"serl.mixing_lambda must be in [0, 1], got {mixing_lambda}.")
+
+    lambda_decay_steps = int(serl_config.get("lambda_decay_steps", 0))
+    if lambda_decay_steps < 0:
+        raise ValueError(f"serl.lambda_decay_steps must be non-negative, got {lambda_decay_steps}.")
+    if lambda_decay_steps == 0:
+        return mixing_lambda
+
+    lambda_scale = max(0.0, 1.0 - (float(update_step) / float(lambda_decay_steps)))
+    return mixing_lambda * lambda_scale
+
+
+def compute_serl_action_mask_reweighted_advantages(
+    *,
+    advantages: torch.Tensor,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    serl_config: Any,
+    update_step: int,
+    serl_mask: Optional[torch.Tensor] = None,
+    serl_action_mask: Optional[torch.Tensor] = None,
+):
+    """Reweight PPO advantages only on parsed action tokens."""
+
+    weight_clip = float(serl_config.get("weight_clip", 0.2))
+    if weight_clip < 0.0:
+        raise ValueError(f"serl.weight_clip must be non-negative, got {weight_clip}.")
+
+    effective_lambda = _serl_effective_lambda(serl_config, update_step)
+    delta = (teacher_log_probs - student_log_probs).detach()
+    signed_delta = torch.sign(advantages.detach()) * delta
+    signed_delta = signed_delta.clamp(min=-20.0, max=20.0)
+    weights = torch.exp(signed_delta)
+    clipped_weights = weights.clamp(min=1.0 - weight_clip, max=1.0 + weight_clip)
+
+    base_mask = response_mask.bool()
+    if serl_mask is not None:
+        base_mask = base_mask & serl_mask.unsqueeze(-1).bool()
+
+    if serl_action_mask is None:
+        serl_action_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    if serl_action_mask.shape != response_mask.shape:
+        raise ValueError(
+            f"serl_action_mask must have shape {tuple(response_mask.shape)}, "
+            f"got {tuple(serl_action_mask.shape)}."
+        )
+    selected_mask = base_mask & serl_action_mask.bool()
+
+    blended_weights = torch.ones_like(clipped_weights)
+    if selected_mask.any():
+        blended_values = (1.0 - effective_lambda) + effective_lambda * clipped_weights
+        blended_weights = torch.where(selected_mask, blended_values, blended_weights)
+
+    token_advantages = advantages * blended_weights
+    token_advantages = token_advantages * response_mask.float()
+
+    base_count = base_mask.float().sum().clamp_min(1.0)
+    selected_count = selected_mask.float().sum()
+    if selected_mask.any():
+        valid_weights = clipped_weights.masked_select(selected_mask)
+        valid_delta_abs = delta.abs().masked_select(selected_mask)
+        clip_low = 1.0 - weight_clip
+        clip_high = 1.0 + weight_clip
+        clipped_fraction = (
+            ((valid_weights <= clip_low + 1e-6) | (valid_weights >= clip_high - 1e-6)).float().mean().item()
+        )
+        metrics = {
+            "serl_action_mask/effective_lambda": effective_lambda,
+            "serl_action_mask/weight_mean": valid_weights.mean().item(),
+            "serl_action_mask/weight_max": valid_weights.max().item(),
+            "serl_action_mask/weight_min": valid_weights.min().item(),
+            "serl_action_mask/delta_abs_mean": valid_delta_abs.mean().item(),
+            "serl_action_mask/candidate_fraction": (selected_count / base_count).item(),
+            "serl_action_mask/selected_fraction": (selected_count / base_count).item(),
+            "serl_action_mask/clipped_fraction": clipped_fraction,
+            "serl_action_mask/empty_target_batch": 0.0,
+        }
+    else:
+        metrics = {
+            "serl_action_mask/effective_lambda": effective_lambda,
+            "serl_action_mask/weight_mean": 1.0,
+            "serl_action_mask/weight_max": 1.0,
+            "serl_action_mask/weight_min": 1.0,
+            "serl_action_mask/delta_abs_mean": 0.0,
+            "serl_action_mask/candidate_fraction": 0.0,
+            "serl_action_mask/selected_fraction": 0.0,
+            "serl_action_mask/clipped_fraction": 0.0,
+            "serl_action_mask/empty_target_batch": 1.0,
+        }
+
+    return token_advantages, metrics
 
 
 def compute_policy_loss(

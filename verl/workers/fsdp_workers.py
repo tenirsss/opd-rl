@@ -569,7 +569,12 @@ class ActorRolloutRefWorker(Worker):
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
-            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            # OPD: 若配置了 teacher 路径, ref policy 托管(冻结的)更强 teacher 做 on-policy distillation;
+            # 否则退化为标准 ref(同 actor 模型)。
+            ref_model_path = self.config.model.get("opd_teacher_path", None) or self.config.model.path
+            if ref_model_path != self.config.model.path:
+                print(f"[OPD] ref policy 加载 teacher 模型: {ref_model_path}")
+            local_path = copy_to_local(ref_model_path, use_shm=use_shm)
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=self.config.ref.fsdp_config,
@@ -586,6 +591,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            if self._is_actor and self.config.actor.policy_loss.get("loss_mode", "vanilla") == "serl_action_mask":
+                self.actor.teacher_module = self.ref_module_fsdp
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)

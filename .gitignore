@@ -1,6 +1,9 @@
 
 **/*.pt
 **/checkpoints
+checkpoints/
+ckpts/
+models/
 **/wget-log
 **/_build/
 **/*.ckpt
@@ -131,4 +134,3 @@ outputs
 data/
 .tmp
 *ports
-

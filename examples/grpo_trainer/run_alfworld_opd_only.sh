@@ -1,41 +1,50 @@
+#纯opd测试，7b instruct蒸instruct
 #!/usr/bin/env bash
 set -x
-set -o pipefail   # 让 tee 不吞掉 python 的退出码
+set -o pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=${REPO_DIR:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}
 MODEL_ROOT=${MODEL_ROOT:-$REPO_DIR/models}
 DATA_DIR=${DATA_DIR:-$REPO_DIR/data}
-MODEL_PATH=${MODEL_PATH:-$MODEL_ROOT/Qwen2.5-1.5B-Instruct}
+CKPT_ROOT=${CKPT_ROOT:-$REPO_DIR/ckpts}
 cd "$REPO_DIR"
 
 ENGINE=${1:-vllm}
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN   # 本 venv 没装 xformers, 用已装的 flash_attn 2.8.3 后端
-export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}   # prepare 要下 hiyouga/geometry3k 占位数据集, 走镜像
+shift 2>/dev/null || true
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+export HF_HUB_ENABLE_HF_TRANSFER=0
 
-# 日志落盘: 默认写到脚本同级的 logs/alfworld/ 下, 可用 LOG_DIR=... 覆盖
-LOG_DIR=${LOG_DIR:-"$(cd "$(dirname "$0")" && pwd)/logs/alfworld"}
+STUDENT_PATH=${STUDENT_PATH:-$MODEL_ROOT/Qwen2.5-1.5B-Instruct}
+TEACHER_PATH=${TEACHER_PATH:-$MODEL_ROOT/Qwen2.5-7B-Instruct}
+OPD_COEF=${OPD_COEF:-1.0}
+
+export ALFWORLD_DATA=${ALFWORLD_DATA:-$DATA_DIR}
+
+LOG_DIR=${LOG_DIR:-"$(cd "$(dirname "$0")" && pwd)/logs/alfworld_opd_only"}
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/run_$(date +%Y%m%d_%H%M%S).log"
 echo "日志写入: $LOG_FILE"
 
-num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
-
+num_cpus_per_env_worker=0.1
 train_data_size=16
 val_data_size=128
 group_size=8
-mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
 
-# We only use data preparation to indicate the modality and the data size.
-python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
-    --local_dir "$DATA_DIR" \
-    --train_data_size $train_data_size \
-    --val_data_size $val_data_size 2>&1 | tee "$LOG_FILE"
+if [ ! -f "$DATA_DIR/text/train.parquet" ]; then
+    python3 -m examples.data_preprocess.prepare \
+        --mode 'text' \
+        --local_dir "$DATA_DIR" \
+        --train_data_size $train_data_size \
+        --val_data_size $val_data_size 2>&1 | tee "$LOG_FILE"
+else
+    echo "parquet 已存在, 跳过 prepare: $DATA_DIR/text/" | tee "$LOG_FILE"
+fi
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=gigpo \
-    data.train_files="$DATA_DIR/text/train.parquet" \
-    data.val_files="$DATA_DIR/text/test.parquet" \
+    algorithm.adv_estimator=grpo \
+    data.train_files=$DATA_DIR/text/train.parquet \
+    data.val_files=$DATA_DIR/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=2048 \
@@ -43,34 +52,33 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path="$MODEL_PATH" \
+    actor_rollout_ref.model.path=$STUDENT_PATH \
+    actor_rollout_ref.model.opd_teacher_path=$TEACHER_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=$OPD_COEF \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.opd_only=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
-    algorithm.gamma=0.95 \
-    algorithm.gigpo.step_advantage_w=1.0 \
-    algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
     env.max_steps=50 \
@@ -79,10 +87,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b' \
+    trainer.experiment_name='opd_only_qwen2.5_1.5b_teacher7b' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=40 \
+    trainer.default_local_dir=$CKPT_ROOT/opd_only_qwen2.5_1.5b_teacher7b \
+    trainer.resume_mode=auto \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=True $@ 2>&1 | tee -a "$LOG_FILE"
+    trainer.val_before_train=False $@ 2>&1 | tee -a "$LOG_FILE"

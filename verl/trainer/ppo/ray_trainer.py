@@ -60,8 +60,6 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-from gigpo import core_gigpo
-
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -343,6 +341,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GiGPO:
+        from recipe.gigpo import core_gigpo
+
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
             step_rewards=data.batch['step_rewards'], # for step group reward computing
@@ -662,6 +662,17 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _get_actor_worker_role(self) -> str:
+        return "actor_rollout"
+
+    def _maybe_build_self_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, list]] = None,
+    ):
+        return None
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -735,6 +746,7 @@ class RayPPOTrainer:
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
+                "training_global_step": self.global_steps,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
@@ -842,7 +854,7 @@ class RayPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                role=self._get_actor_worker_role(),
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -1065,6 +1077,9 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                if not isinstance(gen_batch.meta_info, dict):
+                    gen_batch.meta_info = {}
+                gen_batch.meta_info["training_global_step"] = self.global_steps
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1109,6 +1124,8 @@ class RayPPOTrainer:
                     batch = gen_batch_output
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                        from recipe.gigpo import core_gigpo
+
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
@@ -1196,6 +1213,16 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        self_distillation_data = self._maybe_build_self_distillation_batch(
+                            batch=batch,
+                            reward_tensor=reward_tensor,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                        )
+                        if self_distillation_data is not None:
+                            self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            batch = batch.union(self_distillation_batch)
+                            metrics.update(self_distillation_metrics)
+
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1268,11 +1295,43 @@ class RayPPOTrainer:
                             )
 
                     # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                    do_periodic_eval = self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0
+                    do_final_eval = is_last_step and self.config.trainer.get("final_eval_after_train", True)
+                    if self.val_reward_fn is not None and (do_periodic_eval or do_final_eval):
                         with _timer("testing", timing_raw):
                             val_metrics: dict = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics
+                                final_eval_file = self.config.trainer.get("final_eval_metrics_file", "final_eval_metrics.json")
+                                if final_eval_file:
+                                    final_eval_dir = self.config.trainer.default_local_dir
+                                    if not os.path.isabs(final_eval_dir):
+                                        final_eval_dir = os.path.join(os.getcwd(), final_eval_dir)
+                                    os.makedirs(final_eval_dir, exist_ok=True)
+                                    final_eval_path = os.path.join(final_eval_dir, final_eval_file)
+
+                                    def _jsonable(obj):
+                                        if isinstance(obj, np.generic):
+                                            return obj.item()
+                                        if isinstance(obj, torch.Tensor):
+                                            return obj.item() if obj.numel() == 1 else obj.detach().cpu().tolist()
+                                        if isinstance(obj, dict):
+                                            return {k: _jsonable(v) for k, v in obj.items()}
+                                        if isinstance(obj, (list, tuple)):
+                                            return [_jsonable(v) for v in obj]
+                                        return obj
+
+                                    with open(final_eval_path, "w") as f:
+                                        json.dump(
+                                            {
+                                                "global_step": self.global_steps,
+                                                "metrics": _jsonable(val_metrics),
+                                            },
+                                            f,
+                                            indent=2,
+                                            sort_keys=True,
+                                        )
+                                    print(f"Final validation metrics written to: {final_eval_path}")
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):

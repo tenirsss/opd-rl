@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import torch
 import numpy as np
 from verl import DataProto
@@ -24,6 +25,7 @@ import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
+from recipe.serl.privileged_context import attach_rollout_level_judges
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 class TrajectoryCollector:
@@ -39,6 +41,122 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+
+    def _should_collect_immediate_feedback(self) -> bool:
+        actor_cfg = getattr(self.config, "actor_rollout_ref", None)
+        if actor_cfg is None:
+            return False
+        actor_cfg = getattr(actor_cfg, "actor", None)
+        if actor_cfg is None:
+            return False
+        policy_loss_cfg = actor_cfg.get("policy_loss", None)
+        if policy_loss_cfg is None:
+            return False
+        loss_mode = policy_loss_cfg.get("loss_mode", "vanilla")
+        if loss_mode == "serl_action_mask":
+            serl_cfg = actor_cfg.get("serl", None)
+            if serl_cfg is None:
+                return False
+            sampling_mode = str(serl_cfg.get("sampling_mode", "legacy"))
+            if sampling_mode != "legacy":
+                return True
+            return bool(serl_cfg.get("include_immediate_feedback", serl_cfg.get("include_environment_feedback", False)))
+        return False
+
+    def _should_collect_serl_sampling_metadata(self) -> bool:
+        actor_cfg = getattr(self.config, "actor_rollout_ref", None)
+        if actor_cfg is None:
+            return False
+        actor_cfg = getattr(actor_cfg, "actor", None)
+        if actor_cfg is None:
+            return False
+        policy_loss_cfg = actor_cfg.get("policy_loss", None)
+        if policy_loss_cfg is None or policy_loss_cfg.get("loss_mode", "vanilla") != "serl_action_mask":
+            return False
+        serl_cfg = actor_cfg.get("serl", None)
+        if serl_cfg is None:
+            return False
+        return str(serl_cfg.get("sampling_mode", "legacy")) != "legacy"
+
+    def _get_serl_cfg(self):
+        actor_cfg = getattr(self.config, "actor_rollout_ref", None)
+        if actor_cfg is None:
+            return None
+        actor_cfg = getattr(actor_cfg, "actor", None)
+        if actor_cfg is None:
+            return None
+        policy_loss_cfg = actor_cfg.get("policy_loss", None)
+        if policy_loss_cfg is None or policy_loss_cfg.get("loss_mode", "vanilla") != "serl_action_mask":
+            return None
+        return actor_cfg.get("serl", None)
+
+    @staticmethod
+    def _remove_thinking_trace(text: str) -> str:
+        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+
+    @staticmethod
+    def _normalize_immediate_feedback(value):
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            value = value.tolist() if value.ndim > 0 else value.item()
+        if isinstance(value, (list, tuple)):
+            value = "\n".join(str(item) for item in value if item is not None)
+        else:
+            value = str(value)
+        value = value.strip()
+        return value if value else None
+
+    def _collect_immediate_feedback(self, next_obs: Dict, infos: List[Dict], batch_size: int) -> np.ndarray:
+        anchor_obs = next_obs.get("anchor", None)
+        text_obs = next_obs.get("text", None)
+        immediate_feedback = []
+
+        for idx in range(batch_size):
+            candidates = []
+            if anchor_obs is not None:
+                candidates.append(anchor_obs[idx])
+            if infos[idx] is not None:
+                candidates.extend(
+                    [
+                        infos[idx].get("observation_text"),
+                        infos[idx].get("feedback"),
+                    ]
+                )
+            if text_obs is not None:
+                candidates.append(text_obs[idx])
+
+            feedback_text = None
+            for candidate in candidates:
+                feedback_text = self._normalize_immediate_feedback(candidate)
+                if feedback_text is not None:
+                    break
+            immediate_feedback.append(feedback_text)
+
+        return np.array(immediate_feedback, dtype=object)
+
+    def _collect_next_observation_text(self, next_obs: Dict, infos: List[Dict], batch_size: int) -> np.ndarray:
+        anchor_obs = next_obs.get("anchor", None)
+        text_obs = next_obs.get("text", None)
+        next_state_text = []
+
+        for idx in range(batch_size):
+            candidates = []
+            if text_obs is not None:
+                candidates.append(text_obs[idx])
+            if infos[idx] is not None:
+                candidates.append(infos[idx].get("observation_text"))
+            if anchor_obs is not None:
+                candidates.append(anchor_obs[idx])
+
+            next_text = None
+            for candidate in candidates:
+                next_text = self._normalize_immediate_feedback(candidate)
+                if next_text is not None:
+                    break
+            next_state_text.append(next_text)
+
+        return np.array(next_state_text, dtype=object)
 
     def preprocess_single_sample(
         self,
@@ -178,6 +296,7 @@ class TrajectoryCollector:
             'position_ids': position_ids[0],
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
+            'prompt_text': obs_content,
             'index': item,
             'data_source': data_source
         })
@@ -257,6 +376,7 @@ class TrajectoryCollector:
         success_rate = {}
         for key, value in success.items():
             success_rate[key] = np.mean(value)
+        rollout_success_values = success.get("success_rate", np.zeros(batch_size, dtype=np.float32))
         
         effective_batch = []
         for bs in range(batch_size):
@@ -270,6 +390,7 @@ class TrajectoryCollector:
                     data['episode_lengths'] = episode_lengths[bs]
                     # tool_callings
                     data['tool_callings'] = tool_callings[bs]
+                    data['rollout_success'] = bool(float(rollout_success_values[bs]) >= 0.5)
                     # success_rate
                     for key, value in success_rate.items():
                         data[key] = value
@@ -361,6 +482,7 @@ class TrajectoryCollector:
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+            batch.non_tensor_batch["response_text"] = np.array(text_actions, dtype=object)
             
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
@@ -375,6 +497,21 @@ class TrajectoryCollector:
                 batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
             else:
                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+
+            if self._should_collect_serl_sampling_metadata():
+                batch.non_tensor_batch["step_id"] = np.full(batch_size, _step, dtype=np.int32)
+                batch.non_tensor_batch["next_observation_text"] = self._collect_next_observation_text(
+                    next_obs=next_obs,
+                    infos=infos,
+                    batch_size=batch_size,
+                )
+
+            if self._should_collect_immediate_feedback():
+                batch.non_tensor_batch["immediate_feedback"] = self._collect_immediate_feedback(
+                    next_obs=next_obs,
+                    infos=infos,
+                    batch_size=batch_size,
+                )
 
             if 'tool_calling' in infos[0]:
                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
@@ -524,6 +661,21 @@ class TrajectoryCollector:
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)
         assert len(total_batch_list) == len(totoal_tool_callings)
+
+        serl_cfg = self._get_serl_cfg()
+        if serl_cfg is not None:
+            training_global_step = 0
+            if isinstance(gen_batch.meta_info, dict):
+                training_global_step = int(gen_batch.meta_info.get("training_global_step", 0))
+            attach_rollout_level_judges(
+                total_batch_list=total_batch_list,
+                episode_rewards=total_episode_rewards,
+                episode_lengths=total_episode_lengths,
+                cfg=serl_cfg,
+                remove_thinking_trace=self._remove_thinking_trace,
+                training_global_step=training_global_step,
+                critic_warmup=int(self.config.trainer.get("critic_warmup", 0)),
+            )
         
 
         # Create trajectory data
