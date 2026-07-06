@@ -1,3 +1,5 @@
+> **OPD-RL fork note:** this fork adds SERL/OPD reproduction scripts for ALFWorld experiments. See [readme_lookhere.md](./readme_lookhere.md) for the exact setup, model downloads, and TODO experiment commands. The upstream project remains `verl-agent`, so some environment/package names still use `verl-agent`.
+
 <p align="center">
     <img src="./docs/gigpo/logo-verl-agent.png" alt="logo" width="55%">
 </p>
